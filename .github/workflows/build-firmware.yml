@@ -224,26 +224,28 @@ jobs:
       - name: Organize release directory
         run: |
           mkdir -p release
-          find release-files -type f -exec cp -f {} release/ \;
+          # 递归收集所有构建产物文件，遇到 sha256sums 时带上前缀避免重名覆盖
+          find release-files -type f | while read -r f; do
+            fname="$(basename "$f")"
+            parent_dir="$(basename "$(dirname "$f")")"
+            if [ "$fname" = "sha256sums" ]; then
+              cp -f "$f" "release/sha256sums-${parent_dir}"
+            else
+              cp -f "$f" release/
+            fi
+          done
           cd release
           ls -lh
-          sha256sum * > SHA256SUMS
+          sha256sum * > SHA256SUMS-ALL || true
           cd -
 
       - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
-          PRERELEASE: ${{ inputs.prerelease || false }}
-        run: |
-          args=(
-            "$RELEASE_TAG"
-            release/*
-            --repo "$GITHUB_REPOSITORY"
-            --title "PonWrt Firmware $RELEASE_TAG"
-            --generate-notes
-          )
-          if [ "$PRERELEASE" = "true" ]; then
-            args+=(--prerelease)
-          fi
-          gh release create "${args[@]}"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: PonWrt Firmware ${{ needs.prepare.outputs.release_tag }}
+          files: release/*
+          prerelease: ${{ inputs.prerelease || false }}
+          generate_release_notes: true
