@@ -1,0 +1,212 @@
+name: Build PonWrt Firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '选择编译目标架构'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - an7581
+          - an7583
+      release:
+        description: '是否发布到 GitHub Releases'
+        required: true
+        default: true
+        type: boolean
+      tag:
+        description: 'Release Tag (留空则自动按日期生成)'
+        required: false
+        default: ''
+        type: string
+      prerelease:
+        description: '是否标记为预发布 (Pre-release)'
+        required: true
+        default: false
+        type: boolean
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare Build
+    runs-on: ubuntu-24.04
+    outputs:
+      targets: ${{ steps.set-targets.outputs.targets }}
+      release_tag: ${{ steps.set-tag.outputs.release_tag }}
+    steps:
+      - name: Set target matrix
+        id: set-targets
+        run: |
+          target_choice="${{ inputs.target || 'all' }}"
+          if [ "$target_choice" = "an7581" ]; then
+            echo 'targets=["an7581"]' >> "$GITHUB_OUTPUT"
+          elif [ "$target_choice" = "an7583" ]; then
+            echo 'targets=["an7583"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'targets=["an7581", "an7583"]' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set Release Tag
+        id: set-tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v$(date +'%Y.%m.%d-%H%M')"
+          fi
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Build Tag: $TAG"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.prepare.outputs.targets) }}
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo docker image prune -a -f || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install Build Dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+
+      - name: Update & Install Feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Load Repository Signing Key (Optional)
+        env:
+          PONWRT_APK_PRIVATE_KEY: ${{ secrets.PONWRT_APK_PRIVATE_KEY }}
+        run: |
+          if [ -n "$PONWRT_APK_PRIVATE_KEY" ]; then
+            umask 077
+            printf '%s\n' "$PONWRT_APK_PRIVATE_KEY" > private-key.pem
+            openssl ec -in private-key.pem -pubout -out public-key.pem
+          fi
+
+      - name: Generate .config
+        run: |
+          ./scripts/kconfig.pl + \
+            "configs/${{ matrix.target }}.config" \
+            configs/release.config > .config
+          make defconfig
+
+      - name: Download Package Sources
+        run: |
+          make download -j"$(nproc)"
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: Compile Firmware
+        id: compile
+        run: |
+          echo "Starting compilation for ${{ matrix.target }} with $(nproc) threads..."
+          make -j"$(nproc)" || make -j1 V=s
+          echo "status=success" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Firmware Artifacts
+        id: organize
+        run: |
+          TARGET_DIR="bin/targets/airoha/${{ matrix.target }}"
+          OUTPUT_DIR="output-${{ matrix.target }}"
+          mkdir -p "$OUTPUT_DIR"
+
+          # 1. 复制镜像文件及校验和文件
+          find "$TARGET_DIR" -maxdepth 1 -type f \( \
+            -name "*.bin" -o -name "*.ubi" -o -name "*.tar.zst" -o -name "*.manifest" -o -name "sha256sums" \
+          \) -exec cp -f {} "$OUTPUT_DIR"/ \;
+
+          # 2. 生成包含全量目标的压缩归档包
+          tar --zstd -cf "$OUTPUT_DIR/ponwrt-${{ matrix.target }}.tar.zst" \
+            -C bin/targets/airoha "${{ matrix.target }}"
+
+          # 3. 为所有输出文件生成 sha256 校验和
+          cd "$OUTPUT_DIR"
+          sha256sum * > "sha256sums-${{ matrix.target }}" || true
+          cd -
+
+          echo "PACK_DIR=$OUTPUT_DIR" >> "$GITHUB_ENV"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ponwrt-${{ matrix.target }}
+          path: ${{ env.PACK_DIR }}/*
+          retention-days: 14
+
+  release:
+    name: Publish Release
+    needs: [prepare, build]
+    if: ${{ github.event_name == 'push' || inputs.release == true }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+
+      - name: Organize release directory
+        run: |
+          mkdir -p release
+          find release-files -type f -exec cp -f {} release/ \;
+          cd release
+          ls -lh
+          sha256sum * > SHA256SUMS
+          cd -
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          PRERELEASE: ${{ inputs.prerelease || false }}
+        run: |
+          args=(
+            "$RELEASE_TAG"
+            release/*
+            --repo "$GITHUB_REPOSITORY"
+            --title "PonWrt Firmware $RELEASE_TAG"
+            --generate-notes
+          )
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}"
