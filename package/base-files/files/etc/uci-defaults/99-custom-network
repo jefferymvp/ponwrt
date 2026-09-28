@@ -1,0 +1,22 @@
+#!/bin/sh
+# Custom default settings for PonWrt
+
+# 1. 设置 LAN 口 IP 为 192.168.6.88，子网掩码 255.255.255.0，网关与 DNS 为 192.168.6.1
+uci -q batch <<-EOF
+	set network.lan.ipaddr='192.168.6.88'
+	set network.lan.netmask='255.255.255.0'
+	set network.lan.gateway='192.168.6.1'
+	delete network.lan.dns
+	add_list network.lan.dns='192.168.6.1'
+	commit network
+EOF
+
+# 2. 禁用 LAN 口 DHCP 服务 (IPv4 忽略 + IPv6 禁用)
+uci -q batch <<-EOF
+	set dhcp.lan.ignore='1'
+	set dhcp.lan.dhcpv6='disabled'
+	set dhcp.lan.ra='disabled'
+	commit dhcp
+EOF
+
+exit 0
