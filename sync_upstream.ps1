@@ -64,43 +64,58 @@ if ($hasChanges) {
     }
 }
 
-# 5. 智能冲突自愈（针对配置清单类非互斥文件自动融合保留）
+# 5. 冲突检测与用户确认合并
 $unmergedFiles = git diff --name-only --diff-filter=U
 if ($unmergedFiles) {
-    Write-Host "`n[检测] 检测到合并冲突，正在尝试对非互斥配置进行自动融合..." -ForegroundColor Yellow
-    $autoResolvedCount = 0
+    Write-Host "`n[检测] 发现文件冲突！" -ForegroundColor Yellow
 
-    foreach ($file in $unmergedFiles) {
-        if ($file -match '\.(config|conf)$' -or $file -match '^configs/' -or $file -match 'feeds\.conf') {
-            if (Test-Path $file) {
-                Write-Host "  -> 配置文件 [$file] 判定为非互斥清单，正在自动保留双方新增内容..." -ForegroundColor Cyan
-                $content = Get-Content -Path $file -Raw -Encoding UTF8
-                if ($content -match '<<<<<<<') {
-                    $resolved = [regex]::Replace($content, '(?s)<<<<<<<[^\r\n]*\r?\n(.*?)\r?\n=======\r?\n(.*?)\r?\n>>>>>>>[^\r\n]*', {
-                        param($match)
-                        $sideUpstream = $match.Groups[1].Value.Trim()
-                        $sideLocal = $match.Groups[2].Value.Trim()
-                        return "$sideUpstream`r`n`r`n$sideLocal"
-                    })
-                    Set-Content -Path $file -Value $resolved -Encoding UTF8
-                    git add $file
-                    $autoResolvedCount++
-                    Write-Host "  [√] 已成功将上游更新与本地配置同时保留，并自动标记冲突解决！" -ForegroundColor Green
+    # 筛选属于配置清单类的非互斥文件与其它文件
+    $configFiles = @($unmergedFiles | Where-Object { $_ -match '\.(config|conf)$' -or $_ -match '^configs/' -or $_ -match 'feeds\.conf' })
+    $otherFiles = @($unmergedFiles | Where-Object { $configFiles -notcontains $_ })
+
+    if ($configFiles.Count -gt 0) {
+        Write-Host "`n检测到以下配置文件存在冲突（双方新增内容通常可同时保留）：" -ForegroundColor Cyan
+        $configFiles | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+
+        $confirm = Read-Host "`n是否尝试自动保留双方配置并合并? (Y/N) [默认 Y]"
+        if ([string]::IsNullOrWhiteSpace($confirm)) { $confirm = "Y" }
+
+        if ($confirm -match "^[Yy]") {
+            foreach ($file in $configFiles) {
+                if (Test-Path $file) {
+                    $content = Get-Content -Path $file -Raw -Encoding UTF8
+                    if ($content -match '<<<<<<<') {
+                        $resolved = [regex]::Replace($content, '(?s)<<<<<<<[^\r\n]*\r?\n(.*?)\r?\n=======\r?\n(.*?)\r?\n>>>>>>>[^\r\n]*', {
+                            param($match)
+                            $sideUpstream = $match.Groups[1].Value.Trim()
+                            $sideLocal = $match.Groups[2].Value.Trim()
+                            return "$sideUpstream`r`n`r`n$sideLocal"
+                        })
+                        Set-Content -Path $file -Value $resolved -Encoding UTF8
+                        git add $file
+                        Write-Host "  [√] 已自动合并并保留双方配置: $file" -ForegroundColor Green
+                    }
                 }
             }
+        } else {
+            Write-Host "已跳过自动合并，冲突标记已保留，请手动检查解决。" -ForegroundColor Yellow
         }
     }
 
-    # 重新检查是否仍有未解决的冲突
+    if ($otherFiles.Count -gt 0) {
+        Write-Host "`n[提示] 以下非配置文件（如代码/补丁/脚本）存在逻辑冲突，需手动检查解决:" -ForegroundColor Magenta
+        $otherFiles | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+    }
+
+    # 检查最终是否仍有未解决的冲突
     $remainingConflicts = git diff --name-only --diff-filter=U
     if ($remainingConflicts) {
-        Write-Host "`n[警告] 以下非配置文件（如代码/补丁/脚本）仍存在冲突，请手动检查解决:" -ForegroundColor Magenta
-        $remainingConflicts | ForEach-Object { Write-Host " - $_" -ForegroundColor Red }
+        $mergeStatus = 1
     } else {
         $mergeStatus = 0
-        Write-Host "`n[成功] 配置文件冲突已全部自动融合解决！" -ForegroundColor Green
+        Write-Host "`n[成功] 冲突已全部解决！" -ForegroundColor Green
         if ($hasChanges) {
-            # 解决冲突后自动清理 stash 缓存副本
+            # 解决完毕后清理本次 stash 缓存
             git stash drop >$null 2>&1
         }
     }
