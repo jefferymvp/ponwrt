@@ -12,6 +12,26 @@ on:
           - all
           - an7581
           - an7583
+      device:
+        description: '选择 AN7581 具体型号 (选 all 编译全部支持的型号)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - fiberhome_hg5585f-ct
+          - fiberhome_hg5585f-ct-usb-sfp
+          - fiberhome_hg5585f-cu
+          - fiberhome_hg5585f-cu-usb-sfp
+          - fiberhome_hg5382a
+          - nokia_xg-040g-md-ubi
+          - nokia_xg-040g-md-ubi-usb-sfp
+          - nokia_xg-040g-tf-ubi
+          - znxt_zn515xg-d
+          - znxt_zn504xg-d
+          - unionman_ung00a
+          - gemtek_xg2010g
+          - airoha_an7581-evb
       release:
         description: '是否发布到 GitHub Releases'
         required: true
@@ -128,6 +148,16 @@ jobs:
           ./scripts/kconfig.pl + \
             "configs/${{ matrix.target }}.config" \
             configs/release.config > .config
+
+          # 如果编译目标为 an7581 且用户指定了具体设备型号 (非 all)
+          if [ "${{ matrix.target }}" = "an7581" ] && [ "${{ inputs.device }}" != "all" ] && [ -n "${{ inputs.device }}" ]; then
+            echo "::notice::精准仅编译指定设备型号: ${{ inputs.device }}"
+            # 取消默认选中的全部 an7581 设备
+            sed -i -E 's/^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.*=y/# & is not set/g' .config
+            # 开启用户单独指定的设备
+            echo "CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_${{ inputs.device }}=y" >> .config
+          fi
+
           make defconfig
 
       - name: Download Package Sources
@@ -147,7 +177,14 @@ jobs:
         id: organize
         run: |
           TARGET_DIR="bin/targets/airoha/${{ matrix.target }}"
-          OUTPUT_DIR="output-${{ matrix.target }}"
+          DEVICE_NAME="${{ inputs.device || 'all' }}"
+          if [ "${{ matrix.target }}" = "an7581" ] && [ "$DEVICE_NAME" != "all" ]; then
+            OUTPUT_DIR="output-${{ matrix.target }}-$DEVICE_NAME"
+            ARCHIVE_NAME="ponwrt-${{ matrix.target }}-$DEVICE_NAME.tar.zst"
+          else
+            OUTPUT_DIR="output-${{ matrix.target }}"
+            ARCHIVE_NAME="ponwrt-${{ matrix.target }}.tar.zst"
+          fi
           mkdir -p "$OUTPUT_DIR"
 
           # 1. 复制镜像文件及校验和文件
@@ -155,8 +192,8 @@ jobs:
             -name "*.bin" -o -name "*.ubi" -o -name "*.tar.zst" -o -name "*.manifest" -o -name "sha256sums" \
           \) -exec cp -f {} "$OUTPUT_DIR"/ \;
 
-          # 2. 生成包含全量目标的压缩归档包
-          tar --zstd -cf "$OUTPUT_DIR/ponwrt-${{ matrix.target }}.tar.zst" \
+          # 2. 生成包含构建产物的压缩归档包
+          tar --zstd -cf "$OUTPUT_DIR/$ARCHIVE_NAME" \
             -C bin/targets/airoha "${{ matrix.target }}"
 
           # 3. 为所有输出文件生成 sha256 校验和
